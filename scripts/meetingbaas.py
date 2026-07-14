@@ -403,6 +403,21 @@ async def main(
         ),
     )
 
+    # Optional: reference a saved OpenAI Prompt object (platform.openai.com
+    # Prompts) instead of the persona README's inline text. Falls back to the
+    # README-derived system message (built further down into `context`) when
+    # OPENAI_PROMPT_ID isn't set, so a missing/misconfigured prompt ID never
+    # leaves the bot silent.
+    prompt_id = persona.get("openai_prompt_id") or os.getenv("OPENAI_PROMPT_ID")
+    using_saved_prompt = bool(prompt_id)
+    if using_saved_prompt:
+        prompt_ref = {"id": prompt_id}
+        prompt_version = persona.get("openai_prompt_version") or os.getenv("OPENAI_PROMPT_VERSION")
+        if prompt_version:
+            prompt_ref["version"] = prompt_version
+        session_properties.prompt = prompt_ref
+        log_and_flush(logging.INFO, f"[LLM] Using saved OpenAI prompt: {prompt_ref}")
+
     # reasoning.effort is only accepted by reasoning-capable Realtime models
     # (e.g. gpt-realtime-2). Setting it on plain gpt-realtime errors, so gate it.
     if "gpt-realtime-2" in realtime_model:
@@ -496,25 +511,30 @@ async def main(
     bot_name = persona_name or "Bot"
     log_and_flush(logging.INFO, f"[BOT] Using bot name: {bot_name}")
 
-    # Create a more comprehensive system prompt
-    system_content = persona["prompt"]
+    if using_saved_prompt:
+        # Instructions come from the saved OpenAI Prompt (session_properties.prompt
+        # above) — sending a competing `system` message here would fight it.
+        log_and_flush(logging.INFO, "[BOT] Skipping README system message — using saved OpenAI prompt instead")
+        messages = []
+    else:
+        # Create a more comprehensive system prompt
+        system_content = persona["prompt"]
 
-    # Add additional context if available
-    if additional_content:
-        system_content += f"\n\nYou are {persona_name}\n\n{DEFAULT_SYSTEM_PROMPT}\n\n"
-        system_content += "You have the following additional context. USE IT TO INFORM YOUR RESPONSES:\n\n"
-        system_content += additional_content
-        system_content += "You are a meeting bot. You are in a meeting with a group of people. You are here to help the group. You are not the host of the meeting. You are not the organizer of the meeting. You are not the participant in the meeting. You are the meeting bot."
-        system_content += "YOU ARE HELP TO HELP. KEEP IT SHORT. EVERYTHING YOU SAY WILL BE REPEATED BACK TO THE GROUP OUT LOUD so DO NOT add PUNCTUATION OR CAPS. JUST SAY WHAT YOU NEED TO SAY IN A CONCISE MANNER."
+        # Add additional context if available
+        if additional_content:
+            system_content += f"\n\nYou are {persona_name}\n\n{DEFAULT_SYSTEM_PROMPT}\n\n"
+            system_content += "You have the following additional context. USE IT TO INFORM YOUR RESPONSES:\n\n"
+            system_content += additional_content
+            system_content += "You are a meeting bot. You are in a meeting with a group of people. You are here to help the group. You are not the host of the meeting. You are not the organizer of the meeting. You are not the participant in the meeting. You are the meeting bot."
+            system_content += "YOU ARE HELP TO HELP. KEEP IT SHORT. EVERYTHING YOU SAY WILL BE REPEATED BACK TO THE GROUP OUT LOUD so DO NOT add PUNCTUATION OR CAPS. JUST SAY WHAT YOU NEED TO SAY IN A CONCISE MANNER."
 
-
-    # Set up messages
-    messages = [
-        {
-            "role": "system",
-            "content": system_content,
-        },
-    ]
+        # Set up messages
+        messages = [
+            {
+                "role": "system",
+                "content": system_content,
+            },
+        ]
 
     # Create the context object - with or without tools
     if enable_tools and tools:

@@ -98,6 +98,11 @@ class PersonaManager:
             # Optional Metadata keys: `openai_voice:` and `language_code:`.
             "openai_voice": metadata.get("openai_voice", ""),
             "language_code": metadata.get("language_code", ""),
+            # Optional: reference a saved OpenAI Prompt (platform.openai.com
+            # /prompts) instead of this README's inline text. Metadata keys:
+            # `openai_prompt_id:` and `openai_prompt_version:`.
+            "openai_prompt_id": metadata.get("openai_prompt_id", ""),
+            "openai_prompt_version": metadata.get("openai_prompt_version", ""),
             "gender": metadata.get("gender", ""),
             "relevant_links": metadata.get("relevant_links", []),
         }

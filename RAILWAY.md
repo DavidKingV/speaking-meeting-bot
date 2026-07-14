@@ -74,6 +74,22 @@ convierte en las `instructions` del modelo Realtime. El campo `cartesia_voice_id
 README ya no aplica; la voz se elige con el campo `openai_voice:` en el bloque Metadata
 del README (o, como fallback, `OPENAI_REALTIME_VOICE`).
 
+### Prompt guardado en OpenAI (opcional, en vez del README)
+
+Si ya tienes un **Prompt** creado en platform.openai.com/prompts (con su `pmpt_...` ID),
+puedes usarlo en lugar del texto del README:
+
+- **Global** (todas las personas): variables de entorno `OPENAI_PROMPT_ID` /
+  `OPENAI_PROMPT_VERSION` en Railway.
+- **Por persona**: campos `openai_prompt_id:` / `openai_prompt_version:` en el bloque
+  `Metadata` del `README.md` de esa persona (tienen prioridad sobre las variables globales).
+
+Cuando hay un `prompt_id` activo, el bot manda `session.prompt = {id, version}` a Realtime
+y **no** envía el texto del README como `instructions` (para no competir con el prompt
+guardado). **Si no configuras ningún `prompt_id`**, todo sigue funcionando como hoy: el
+texto del README es la fuente de las instrucciones. Es decir, el README actúa como
+fallback automático — no hace falta borrarlo ni tocarlo si decides usar un prompt guardado.
+
 ### Persona VoxCare (incluida)
 
 `config/personas/voxcare_coach/README.md` reproduce el agente **VoxCare English Coach
