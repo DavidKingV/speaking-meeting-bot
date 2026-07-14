@@ -19,8 +19,10 @@ COPY pyproject.toml poetry.lock* ./
 # Configure Poetry to not use virtualenvs inside Docker
 RUN poetry config virtualenvs.create false
 
-# Regenerate lock file and install dependencies
-RUN poetry lock && poetry install --no-interaction --no-ansi --no-root
+# Install runtime dependencies only. Dev deps are skipped: they pull an ancient
+# grpcio-tools (1.30.0) that fails to build under Python 3.11 (no pkg_resources
+# in the PEP517 build env). We don't need it — protobufs are pre-generated.
+RUN poetry lock && poetry install --no-interaction --no-ansi --no-root --without dev
 
 # Copy application files
 COPY . .
@@ -28,8 +30,8 @@ COPY . .
 # Set Python path to include the current directory
 ENV PYTHONPATH="/app:${PYTHONPATH}"
 
-# Compile protocol buffers
-RUN poetry run python -m grpc_tools.protoc --proto_path=./protobufs --python_out=./protobufs frames.proto
+# NOTE: protobufs/frames_pb2.py is committed to the repo (already generated), so
+# no grpc_tools.protoc compile step is needed here.
 
 # Environment variables
 ENV PORT=7014
