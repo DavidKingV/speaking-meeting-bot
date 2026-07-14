@@ -94,6 +94,10 @@ class PersonaManager:
             "image": metadata.get("image", ""),
             "entry_message": metadata.get("entry_message", ""),
             "cartesia_voice_id": metadata.get("cartesia_voice_id", ""),
+            # OpenAI Realtime voice + language, read by scripts/meetingbaas.py.
+            # Optional Metadata keys: `openai_voice:` and `language_code:`.
+            "openai_voice": metadata.get("openai_voice", ""),
+            "language_code": metadata.get("language_code", ""),
             "gender": metadata.get("gender", ""),
             "relevant_links": metadata.get("relevant_links", []),
         }

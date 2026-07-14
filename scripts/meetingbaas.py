@@ -8,22 +8,31 @@ import pytz
 from dotenv import load_dotenv
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
-from pipecat.audio.vad.silero import SileroVADAnalyzer, VADParams
-from pipecat.frames.frames import LLMMessagesAppendFrame, TextFrame, TTSSpeakFrame
+from pipecat.frames.frames import LLMMessagesAppendFrame, LLMRunFrame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
-    LLMUserAggregatorParams,
 )
 from pipecat.serializers.protobuf import ProtobufFrameSerializer
-from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
 
-# from pipecat.services.gladia.stt import GladiaSTTService
-from pipecat.services.openai.llm import OpenAILLMService
+# ponytail: switched to OpenAI Realtime (speech-to-speech) so the bot needs only
+# OPENAI_API_KEY — no Cartesia (TTS) / Deepgram (STT) keys. The old 3-service
+# pipeline is preserved in git history; revert this file to get it back if the
+# per-minute Realtime cost matters more than running on a single provider.
+from pipecat.services.openai.realtime.events import (
+    AudioConfiguration,
+    AudioInput,
+    AudioOutput,
+    InputAudioNoiseReduction,
+    InputAudioTranscription,
+    Reasoning,
+    SessionProperties,
+    TurnDetection,
+)
+from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
 from pipecat.transports.websocket.client import (
     WebsocketClientParams,
     WebsocketClientTransport,
@@ -354,23 +363,64 @@ async def main(
     else:
         log_and_flush(logging.INFO, "[PERSONA] No additional content found for persona")
 
-    # Use the voice ID from the persona data, falling back to env var if not set
-    voice_id = persona.get("cartesia_voice_id") or os.getenv("CARTESIA_VOICE_ID")
-    log_and_flush(logging.INFO, f"[PERSONA] Using voice ID: {voice_id}")
+    # OpenAI Realtime voice. Persona files carry a `cartesia_voice_id` that no
+    # longer applies; pick the OpenAI voice from OPENAI_REALTIME_VOICE (or the
+    # persona's optional `openai_voice`), defaulting to "marin".
+    voice_id = persona.get("openai_voice") or os.getenv("OPENAI_REALTIME_VOICE", "marin")
+    log_and_flush(logging.INFO, f"[PERSONA] Using OpenAI Realtime voice: {voice_id}")
 
-    tts = CartesiaTTSService(
-        api_key=os.getenv("CARTESIA_API_KEY"),
-        voice_id=voice_id,
-        sample_rate=output_sample_rate,
+    language = persona.get("language_code", "en-US")
+    log_and_flush(logging.INFO, f"[PERSONA] Using language: {language}")
+
+    # Single speech-to-speech service: OpenAI Realtime does STT + LLM + TTS and
+    # its own server-side turn detection over one WebSocket. Only OPENAI_API_KEY
+    # is required. Model defaults to "gpt-realtime"; override via OPENAI_REALTIME_MODEL.
+    #
+    # Session config mirrors the VoxCare agent from the OpenAI dashboard
+    # (server_vad + far_field + gpt-realtime-whisper transcription + capped
+    # output tokens). Audio stays at the transport's 16 kHz — pipecat resamples
+    # to the 24 kHz the Realtime API uses, so no change to the MeetingBaas
+    # audio contract is needed.
+    realtime_model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+
+    session_properties = SessionProperties(
+        output_modalities=["audio"],
+        max_output_tokens=int(os.getenv("OPENAI_REALTIME_MAX_TOKENS", "2016")),
+        audio=AudioConfiguration(
+            input=AudioInput(
+                transcription=InputAudioTranscription(model="gpt-realtime-whisper"),
+                # server_vad with the dashboard's thresholds (semantic_vad is the
+                # pipecat default; VoxCare uses classic server VAD).
+                turn_detection=TurnDetection(
+                    type="server_vad",
+                    threshold=0.5,
+                    prefix_padding_ms=300,
+                    silence_duration_ms=500,
+                ),
+                noise_reduction=InputAudioNoiseReduction(type="far_field"),
+            ),
+            output=AudioOutput(voice=voice_id),
+        ),
     )
-    log_and_flush(logging.INFO, f"[TTS] Cartesia TTS initialized with sample_rate={output_sample_rate}, voice_id={voice_id}")
 
-    llm = OpenAILLMService(
+    # reasoning.effort is only accepted by reasoning-capable Realtime models
+    # (e.g. gpt-realtime-2). Setting it on plain gpt-realtime errors, so gate it.
+    if "gpt-realtime-2" in realtime_model:
+        session_properties.reasoning = Reasoning(
+            effort=os.getenv("OPENAI_REALTIME_REASONING_EFFORT", "low")
+        )
+
+    llm = OpenAIRealtimeLLMService(
         api_key=os.getenv("OPENAI_API_KEY"),
-        model="gpt-4.1",
-        run_in_parallel=False,
+        settings=OpenAIRealtimeLLMService.Settings(
+            model=realtime_model,
+            session_properties=session_properties,
+        ),
     )
-    log_and_flush(logging.INFO, "[LLM] OpenAI LLM initialized with model=gpt-4.1")
+    log_and_flush(
+        logging.INFO,
+        f"[LLM] OpenAI Realtime initialized (voice={voice_id}, model={realtime_model}, vad=server_vad, noise=far_field)",
+    )
 
     if enable_tools:
         log_and_flush(logging.INFO, "[TOOLS] Registering function tools")
@@ -443,27 +493,6 @@ async def main(
         log_and_flush(logging.INFO, "[TOOLS] Function tools are disabled")
         tools = None
 
-    language = persona.get("language_code", "en-US")
-    log_and_flush(logging.INFO, f"[PERSONA] Using language: {language}")
-
-    deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
-    log_and_flush(logging.INFO, f"[STT] Deepgram API key present: {bool(deepgram_api_key)}")
-    log_and_flush(logging.INFO, f"[STT] Deepgram config: encoding=linear16, sample_rate={output_sample_rate}, language={language}")
-
-    stt = DeepgramSTTService(
-        api_key=deepgram_api_key,
-        encoding="linear16" if streaming_audio_frequency == "16khz" else "linear24",
-        sample_rate=output_sample_rate,
-        settings=DeepgramSTTService.Settings(language=language),
-    )
-
-    # stt = GladiaSTTService(
-    #     api_key=os.getenv("GLADIA_API_KEY"),
-    #     encoding="linear16" if streaming_audio_frequency == "16khz" else "linear24",
-    #     sample_rate=output_sample_rate,
-    #     language=language,  # Use language from persona
-    # )
-
     bot_name = persona_name or "Bot"
     log_and_flush(logging.INFO, f"[BOT] Using bot name: {bot_name}")
 
@@ -493,37 +522,16 @@ async def main(
     else:
         context = LLMContext(messages)
 
-    # Create the context aggregator pair with VAD on the user aggregator
-    # Turn-taking knobs. Precedence: per-request turn_config (rides in the
-    # persona dict from the API) > VAD_* env vars > defaults.
-    #   start_secs — sustained speech required before a turn/interruption
-    #     registers. Raise for bot-vs-bot meetings so TTS tails and breaths
-    #     don't trigger mutual barge-in.
-    #   stop_secs — silence required before the bot considers the speaker
-    #     done and replies. 0.1 (the old hardcode) replied to half-sentences;
-    #     pipecat's default is 0.8.
-    turn_config = (persona.get("turn_config") or {}) if persona else {}
-
-    def _vad_param(key: str, env: str, default: str) -> float:
-        value = turn_config.get(key)
-        return float(value) if value is not None else float(os.getenv(env, default))
-
-    vad_params = VADParams(
-        confidence=_vad_param("confidence", "VAD_CONFIDENCE", "0.5"),
-        start_secs=_vad_param("start_secs", "VAD_START_SECS", "0.25"),
-        stop_secs=_vad_param("stop_secs", "VAD_STOP_SECS", "0.8"),
-        min_volume=_vad_param("min_volume", "VAD_MIN_VOLUME", "0.6"),
-    )
-    log_and_flush(logging.INFO, f"[VAD] Params: {vad_params}")
-
+    # OpenAI Realtime does turn detection server-side (SemanticTurnDetection set
+    # on the service) and emits its own UserStarted/StoppedSpeakingFrame, so the
+    # aggregator runs in realtime_service_mode and carries no local Silero VAD.
+    # The old VAD_* / turn_config knobs no longer apply here — tune turn-taking
+    # via the service's SessionProperties instead.
+    # ponytail: dropped local VAD; server VAD covers it. Add a transport-VAD
+    # variant (turn_detection=False) only if you need locally-driven turns.
     aggregator_pair = LLMContextAggregatorPair(
         context,
-        user_params=LLMUserAggregatorParams(
-            vad_analyzer=SileroVADAnalyzer(
-                sample_rate=16000,
-                params=vad_params,
-            ),
-        ),
+        realtime_service_mode=True,
     )
 
     # Get the user and assistant aggregators from the pair
@@ -537,15 +545,16 @@ async def main(
         my_name=(persona.get("name") if persona else None) or persona_name,
     )
 
+    # S2S pipeline: transport audio in → user aggregator → Realtime (does
+    # STT+LLM+TTS) → floor gate (holds audio while a sibling bot speaks) →
+    # transport audio out → assistant aggregator.
     pipeline = Pipeline([
         transport.input(),   # Add transport input to receive audio/data
-        stt,
         user_aggregator,
         llm,
         floor_gate,
-        tts,
-        assistant_aggregator,
         transport.output(),  # Add transport output to send audio/data
+        assistant_aggregator,
     ])
 
     # Metrics log per-service TTFB (STT/LLM/TTS) — grep journal for "TTFB".
@@ -625,21 +634,26 @@ async def main(
 
         if conversation_started:
             log_and_flush(logging.INFO, "[BOT] Conversation already started — skipping entry message")
-        elif persona_entry_message:
-            # Speak the entry VERBATIM via TTS — instructing the LLM to "say
-            # exactly" proved unreliable (gpt-4.1 riffs on it). Record it in
-            # the context afterwards so the LLM knows what it already said.
-            log_and_flush(logging.INFO, "[BOT] Speaking entry message verbatim via TTS")
-            await task.queue_frames([TTSSpeakFrame(persona_entry_message)])
-            context.messages.append(
-                {"role": "assistant", "content": persona_entry_message}
-            )
         else:
-            # No entry message - prompt LLM to introduce itself
-            log_and_flush(logging.INFO, f"[BOT] No entry message, prompting LLM to introduce")
-            initial_prompt = {"role": "user", "content": "Please introduce yourself and start the conversation."}
-            await task.queue_frames([LLMMessagesAppendFrame(messages=[initial_prompt], run_llm=True)])
-            log_and_flush(logging.INFO, "[BOT] LLM prompted to introduce itself")
+            # Realtime has no standalone TTS frame, so kick off the greeting by
+            # appending an instruction and letting the service generate the audio.
+            # For a scripted entry we ask it to say the line verbatim; otherwise
+            # we ask it to introduce itself. LLMRunFrame triggers the response.
+            if persona_entry_message:
+                log_and_flush(logging.INFO, "[BOT] Prompting Realtime to speak entry message")
+                initial_prompt = {
+                    "role": "user",
+                    "content": f"Start the meeting by saying exactly this, word for word, and nothing else: {persona_entry_message}",
+                }
+            else:
+                log_and_flush(logging.INFO, "[BOT] No entry message, prompting Realtime to introduce")
+                initial_prompt = {
+                    "role": "user",
+                    "content": "Please introduce yourself and start the conversation.",
+                }
+            await task.queue_frames(
+                [LLMMessagesAppendFrame(messages=[initial_prompt]), LLMRunFrame()]
+            )
 
     asyncio.create_task(start_conversation())
 
